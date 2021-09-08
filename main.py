@@ -1,0 +1,137 @@
+#!/usr/bin/env python
+import torch
+from tqdm import tqdm
+import pdb
+import numpy as np
+from torch.autograd import Variable
+import os
+import argparse
+import datasets
+import models
+import pickle
+import time
+import monitoring
+#
+def build_parser():
+    parser = argparse.ArgumentParser(description="")
+
+    ### Hyperparameter options
+    parser.add_argument('--epoch', default=10, type=int, help='The number of epochs we want ot train the network.')
+    parser.add_argument('--seed', default=260389, type=int, help='Seed for random initialization and stuff.')
+    parser.add_argument('--batch-size', default=10000, type=int, help="The batch size.")
+    parser.add_argument('--lr', default=1e-3, type=float, help='learning rate')
+    parser.add_argument('--momentum', default=0.9, type=float, help='momentum')
+    
+
+    ### Dataset specific options
+    parser.add_argument('--data-dir', default='./data/', help='The folder contaning the dataset.')
+    parser.add_argument('--data-file', default='.', help='The data file with the dataset.')
+    parser.add_argument('--dataset', choices=['gene'], default='gene', help='Which dataset to use.')
+    parser.add_argument('--transform', default=True,help='log10(exp+1)')
+    
+    # Model specific options
+    parser.add_argument('--layers-size', default=[25], type=int, nargs='+', help='Number of layers to use.')
+    parser.add_argument('--emb_size', default=50, type=int, help='The size of the embeddings.')
+
+    parser.add_argument('--weight-decay', default=1e-5, type=float, help='The size of the embeddings.')
+    parser.add_argument('--model', choices=['factor', 'triple', 'multiple','doubleoutput', 'choybenchmark'], default='factor', help='Which model to use.')
+    parser.add_argument('--cpu', action='store_true', help='If we want to run on cpu.') # TODO: should probably be cpu instead.
+    parser.add_argument('--name', type=str, default=None, help="If we want to add a random str to the folder.")
+    parser.add_argument('--gpu-selection', type=int, default=1, help="selectgpu")
+
+
+    # Monitoring options
+    parser.add_argument('--load-folder', help='The folder where to load and restart the training.')
+    parser.add_argument('--save-dir', default='./testing123/', help='The folder where everything will be saved.')
+
+    return parser
+
+def parse_args(argv):
+
+    if type(argv) == list or argv is None:
+        opt = build_parser().parse_args(argv)
+    else:
+        opt = argv
+
+    return opt
+
+def main(argv=None):
+
+    opt = parse_args(argv)
+    # TODO: set the seed
+    seed = opt.seed
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.manual_seed(seed)
+
+    exp_dir = opt.load_folder
+    if exp_dir is None: # we create a new folder if we don't load.
+        exp_dir = monitoring.create_experiment_folder(opt)
+
+    # creating the dataset
+    print ("Getting the dataset...")
+    dataset = datasets.get_dataset(opt,exp_dir)
+
+    # Creating a model
+    print ("Getting the model...")
+
+    my_model, optimizer, epoch, opt = monitoring.load_checkpoint(exp_dir, opt, dataset.dataset.input_size(), dataset.dataset.additional_info())
+
+    # Training optimizer and stuff
+    criterion = torch.nn.MSELoss()
+
+    if not opt.cpu:
+        print ("Putting the model on gpu...")
+        my_model.cuda(opt.gpu_selection)
+
+    # The training.
+    print ("Start training.")
+
+    monitoring_dic = {}
+    monitoring_dic['train_loss'] = []
+
+    for t in range(epoch, opt.epoch):
+
+        start_timer = time.time()
+
+        thisepoch_trainloss = []
+
+        with tqdm(dataset, unit="batch") as tepoch:
+            for mini in tepoch:
+                tepoch.set_description(f"Epoch {t}")
+
+
+                inputs, targets = mini[0], mini[1]
+
+                inputs = Variable(inputs, requires_grad=False).float()
+                targets = Variable(targets, requires_grad=False).float()
+
+                if not opt.cpu:
+                    inputs = inputs.cuda(opt.gpu_selection)
+                    targets = targets.cuda(opt.gpu_selection)
+
+                # Forward pass: Compute predicted y by passing x to the model
+                y_pred = my_model(inputs).float()
+                y_pred = y_pred.squeeze()
+
+                targets = torch.reshape(targets,(targets.shape[0],))
+                # Compute and print loss
+
+                loss = criterion(y_pred, targets)
+                to_list = loss.cpu().data.numpy().reshape((1, ))[0]
+                thisepoch_trainloss.append(to_list)
+                tepoch.set_postfix(loss=loss.item())
+
+                np.save(os.path.join(exp_dir, 'pixel_epoch_{}'.format(t)),my_model.emb_1.weight.cpu().data.numpy() )
+                np.save(os.path.join(exp_dir,'digit_epoch_{}'.format(t)),my_model.emb_2.weight.cpu().data.numpy())
+
+                # Zero gradients, perform a backward pass, and update the weights.
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+        monitoring.save_checkpoint(my_model, optimizer, t, opt, exp_dir)
+        monitoring_dic['train_loss'].append(np.mean(thisepoch_trainloss))
+        np.save(f'{exp_dir}/train_loss.npy',monitoring_dic['train_loss'])
+
+if __name__ == '__main__':
+    main()
